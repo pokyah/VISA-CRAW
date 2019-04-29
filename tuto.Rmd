@@ -1,0 +1,658 @@
+---
+title: "Tutorial VISA"
+author: "Thomas Goossens"
+date: "3/26/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r pkg-config, eval = FALSE}
+install.packages("packrat")
+packrat::init()
+install.packages("devtools")
+devtools::install_github("pokyah/mlr", ref = "gstat")
+install.packages("sf")
+install.packages("sp")
+install.packages("mapview")
+install.packages("leaflet.extras")
+install.packages("dplyr")
+install.packages("gstat")
+install.packages("automap")
+install.packages("RColorBrewer")
+install.packages("bestNormalize")
+```
+
+```{r data-load}
+dataset = read.csv(file = "./raw-data/tracteur.csv", header = TRUE,sep = ";" )
+shapefile = sf::st_read(dsn = "./raw-data/shapefile/reves_WGS84.shp")
+```
+
+```{r map-shapefile}
+mapview::mapview(shapefile)
+```
+
+```{r map-records}
+# transforming to spatial sf object
+dataset.sf = sf::st_as_sf(dataset, coords = c("long_deg", "lat_deg"))
+
+# setting the CRS (coordinate reference system)
+dataset.sf = sf::st_set_crs(dataset.sf, 4326)
+
+# map the patinage & traction on static map
+patinage.map = plot(dataset.sf["patinage"])
+traction.map = plot(dataset.sf["traction"])
+```
+
+A point seems to be out of the parcel. Lets remove it by intersecting with the parcel. To do this both objects must be in the same CRS (which is the case - see above).
+
+```{r records-in-parcel}
+# instersecting
+dataset.sf = sf::st_intersection(dataset.sf, shapefile)
+
+# checking the new maps
+patinage.map = plot(dataset.sf["patinage"])
+traction.map = plot(dataset.sf["traction"])
+```
+
+Let's construct a grid of pixels on which we will interpolate
+
+```{r interpolation-grid}
+# Building a grid of cells of 10 m². To do so, we must work with projected data (to define the cellsize)
+interpolation.grid.sf = sf::st_make_grid(x = sf::st_transform(shapefile, crs = 3812),  cellsize = 10, what = "centers")
+
+# mapit on an interactive map 
+mapview::mapview(interpolation.grid.sf)
+```
+
+```{r machine-learning-tasks-preparation}
+library(dplyr)
+
+# converting the spatial object to normal dataframe
+dataset = dataset.sf
+
+# making it projected instead of coordinates (for inteprolation)
+dataset = sf::st_transform(dataset, 3812)
+coordinates = data.frame(sf::st_coordinates(dataset))
+sf::st_geometry(dataset) = NULL
+
+# putting coordinates in the dataframe
+dataset = dataset %>%
+  dplyr::bind_cols(coordinates)
+
+# renaming X and Y to x and y for gstat learner to work
+dataset = dataset %>%
+  dplyr::rename(x = X) %>%
+  dplyr::rename(y = Y)
+
+# creating the 2 tasks
+traction.regr.task = mlr::makeRegrTask(
+  data = dataset, target = "traction") 
+patinage.regr.task = mlr::makeRegrTask(
+  data = dataset, target = "patinage")
+```
+
+```{r machine-learning-algos}
+learners = list(
+  # linear regression
+  LR = mlr::makeFilterWrapper(
+      learner = mlr::makeLearner(
+        cl = "regr.lm",
+        id = "multiReg.x_y",
+        predict.type = 'se'),
+      fw.method = "linear.correlation",
+      fw.mandatory.feat = c("y", "x"),
+      fw.abs = 2),
+  # inverse distance weigthed
+  IDW = mlr::makeLearner(
+    cl = "regr.gstat",
+    id = "idw"),
+  # trend surface order 1, 2 and 3
+  TS1 = mlr::makeLearner(cl = "regr.gstat", id = "mlr-ts1", degree = 1),
+  TS2 = mlr::makeLearner(cl = "regr.gstat", id = "mlr-ts2", degree = 2),
+  TS3 = mlr::makeLearner(cl = "regr.gstat", id = "mlr-ts3", degree = 3)
+)
+
+```
+
+```{r algos-benchmarking}
+# setting the seed for reprocucible results
+set.seed(86)
+
+# defining how we split between training and validation set
+rdesc = mlr::makeResampleDesc("CV", iters = 5)
+
+# benchmark for traction
+traction.bmr = mlr::benchmark(
+  learners = learners, resamplings = rdesc, tasks = traction.regr.task, measures = list(mlr::rmse, mlr::mse, mlr::mae))
+
+# plot summary of bmr
+mlr::plotBMRSummary(traction.bmr, pretty.names = FALSE)
+
+# resample(learner = learner.rf, task = spatial.task,
+#   resampling = resampling, measures = list(auc))
+
+```
+TS3 is the best predictor (if we ignore IDW). Let's use this to spatialize on our grid
+
+```{r train-learner-TS3-IDW}
+model.TS3 = mlr::train(learners$TS3, traction.regr.task)
+model.IDW = mlr::train(learners$IDW, traction.regr.task)
+```
+
+```{r make-grid-pred}
+# converting the interpolation grid to normal dataframe
+interpolation.grid = interpolation.grid.sf
+# making it projected instead of coordinates
+interpolation.grid = sf::st_transform(interpolation.grid, 3812)
+coordinates = data.frame(sf::st_coordinates(interpolation.grid))
+
+# putting coordinates in the dataframe
+interpolation.grid = coordinates
+
+# renaming X and Y to x and y for gstat learner to work
+interpolation.grid  = interpolation.grid  %>%
+  dplyr::rename(x = X) %>%
+  dplyr::rename(y = Y)
+
+# using the model to compute the predictions
+predictions.TS3 = predict(model.TS3, newdata = interpolation.grid)$data
+predictions.IDW = predict(model.IDW, newdata = interpolation.grid)$data
+
+# Building a grid of pixels of 10 m² that spatially matches our grid of centers. To do so, we must work with projected data (to define the cellsize)
+interpolation.grid.pixels.sf = sf::st_sf(sf::st_make_grid(x = sf::st_transform(shapefile, crs = 3812),  cellsize = 10, what = "polygons"))
+
+# adding the predictions to the grid squares object
+spatialized.TS3.sf = interpolation.grid.pixels.sf %>%
+        dplyr::bind_cols(predictions.TS3)
+
+spatialized.IDW.sf = interpolation.grid.pixels.sf %>%
+        dplyr::bind_cols(predictions.IDW)
+
+# making it a spatial object again for mapping
+#spatialized.TS3.sf = sf::st_as_sf(spatialized.TS3, coords = c("y", "x"))
+# setting the CRS
+#spatialized.TS3.sf = sf::st_set_crs(spatialized.TS3.sf, 3812)
+
+# limit it to our parcel shapefile and not full extent
+spatialized.TS3.sf = sf::st_intersection(spatialized.TS3.sf, sf::st_transform(shapefile, crs = 3812))
+
+spatialized.IDW.sf = sf::st_intersection(spatialized.IDW.sf, sf::st_transform(shapefile, crs = 3812))
+
+# mapping 
+mapview::mapview(spatialized.TS3.sf["response"])
+plot(spatialized.TS3.sf["response"])
+plot(spatialized.IDW.sf["response"])
+```
+
+Now let's try with some Kriging
+
+```{r kriging-gstat-way}
+# doing kriging the gstat way for explorative purposes
+# making spatial sp objects
+dataset.sp = dataset
+interpolation.grid.sp = interpolation.grid
+sp::coordinates(dataset.sp) = ~x+y
+sp::coordinates(interpolation.grid.sp) = ~x+y
+sp::gridded(interpolation.grid.sp) = TRUE
+
+# to solve the warnings while using gstat::krige => https://gis.stackexchange.com/questions/222192/r-gstat-krige-covariance-matrix-singular-at-location-5-88-47-4-0-skipping
+
+#::FIXME:: better solution to remove duplicate locations
+dataset.sp = dataset.sp[-sp::zerodist(dataset.sp)[,1],] 
+
+# making and plotting the variogram
+traction.vgm = gstat::variogram(traction~1, dataset.sp)
+plot(traction.vgm)
+
+# manually fitting a model to the vgm with constant mean
+# https://gisgeography.com/semi-variogram-nugget-range-sill/
+traction.fit = gstat::fit.variogram(traction.vgm, model = gstat::vgm(
+  psill = max(traction.vgm$gamma), model = "Sph", range =  150, nugget = 5000000))
+plot(traction.vgm, traction.fit)
+
+# interpolating
+# to solve the memory error  => https://github.com/edzer/gstat/issues/6
+traction.kr = gstat::krige(traction~1, dataset.sp, interpolation.grid.sp, model = traction.fit, maxdist = 30)
+
+# plotting the interpolation
+traction.kr.plot = sp::spplot(traction.kr["var1.pred"], do.log = F, colorkey = TRUE)
+traction.kr.plot
+```
+
+```{r kriging-mlr-way}
+# reusing the cleaned dataset
+dataset = as.data.frame(dataset.sp)
+
+# making the task
+traction.regr.task = mlr::makeRegrTask(
+  data = dataset, target = "traction") 
+
+# defining the kriging learner based on the parameter found via the variogram
+KR = mlr::makeFilterWrapper(
+    learner = mlr::makeLearner(
+      cl = "regr.gstat",
+      id = "ok",
+      par.vals = list(
+        range = 150,
+        psill = max(traction.vgm$gamma),
+        model.manual = "Sph",
+        nugget = 5000000,
+        maxdist = 50,
+        debug.level = 0),
+      predict.type = "se"),
+    fw.method = "linear.correlation",
+    fw.mandatory.feat = c("y", "x"),
+    fw.abs = 2)
+
+# adding this learner to our learners list
+learners = c(learners, list(KR = KR))
+
+# redoing the bmr with the new KR learner
+# traction.bmr = mlr::benchmark(
+#   learners = learners, resamplings = rdesc, tasks = traction.regr.task, measures = list(mlr::rmse))
+
+# plot summary of bmr
+mlr::plotBMRSummary(traction.bmr, pretty.names = FALSE)
+
+# training the learner to build the model
+model.KR = mlr::train(learner = learners$KR, task = traction.regr.task)
+
+# using the model to compute the predictions
+predictions.KR = predict(model.KR, newdata = interpolation.grid)$data
+
+# adding the predictions to the grid squares object
+spatialized.KR.sf = interpolation.grid.pixels.sf %>%
+        dplyr::bind_cols(predictions.KR)
+
+# making it a spatial object again for mapping
+# spatialized.KR.sf = sf::st_as_sf(spatialized.KR, coords = c("y", "x"))
+# # setting the CRS
+# spatialized.KR.sf = sf::st_set_crs(spatialized.KR.sf, 3812)
+
+# limit it to our parcel shapefile and not full extent
+spatialized.KR.sf = sf::st_intersection(spatialized.KR.sf, sf::st_transform(shapefile, crs = 3812))
+
+# mapping 
+mapview::mapview(spatialized.KR.sf["response"])
+plot(spatialized.KR.sf["response"])
+
+
+# redoing the benchmark for traction using all the learners
+# traction.bmr = mlr::benchmark(
+#   learners = learners, resamplings = rdesc, tasks = traction.regr.task, measures = list(mlr::rmse))
+```
+
+
+```{r train-learner-KR}
+model.KR = mlr::train(learners$KR, traction.regr.task)
+```
+
+```{r make-grid-pred-2}
+# using the model to compute the predictions
+predictions.KR = predict(model.KR, newdata = interpolation.grid)$data
+
+# adding the predictions to the grid squares object
+spatialized.KR = interpolation.grid.pixels.sf %>%
+        dplyr::bind_cols(predictions.KR)
+
+# making it a spatial object again for mapping
+spatialized.KR.sf = sf::st_as_sf(spatialized.KR, coords = c("y", "x"))
+# setting the CRS
+spatialized.KR.sf = sf::st_set_crs(spatialized.KR.sf, 3812)
+
+# limit it to our parcel shapefile and not full extent
+spatialized.KR.sf = sf::st_intersection(spatialized.KR.sf, sf::st_transform(shapefile, crs = 3812))
+
+# mapping 
+mapview::mapview(spatialized.KR.sf["response"])
+plot(spatialized.KR.sf["response"])
+```
+
+Making a better map with leaflet
+
+```{r leaflet}
+library(leaflet)
+
+# to make the map responsive
+responsiveness = "\'<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\'"
+  
+# defining the color palette for traction
+tractionPal = leaflet::colorNumeric(
+  palette = "RdYlBu", #"RdBl",
+  reverse = TRUE,
+  domain = spatialized.KR.sf$response, #spatialized$response,
+  na.color = "black"
+)
+
+# projecting in WGS84
+spatialized.KR.sf = sf::st_transform(spatialized.KR.sf, 4326)
+
+traction.map = leaflet::leaflet(spatialized.KR.sf) %>%
+    # basemaps
+    leaflet::addProviderTiles(group = "Satellite",
+      providers$Esri.WorldImagery,
+      options = providerTileOptions(opacity = 1)
+    ) %>%
+    leaflet::addProviderTiles(group = "Stamen",
+      providers$Stamen.Toner,
+      options = providerTileOptions(opacity = 0.25)
+    ) %>%
+    # centering the map
+    leaflet::fitBounds(sf::st_bbox(spatialized.KR.sf)[[1]],
+      sf::st_bbox(spatialized.KR.sf)[[2]],
+      sf::st_bbox(spatialized.KR.sf)[[3]],
+      sf::st_bbox(spatialized.KR.sf)[[4]]
+    ) %>%
+    # adding layer control button
+    leaflet::addLayersControl(
+      baseGroups = c("Satellite","Stamen"),
+     # overlayGroups = c("prediction"),
+      overlayGroups = c("response"),
+        options = layersControlOptions(collapsed = TRUE)
+      ) %>%
+    # fullscreen button
+    leaflet.extras::addFullscreenControl() %>%
+    # location button
+    leaflet::addEasyButton(easyButton(
+      icon = "fa-crosshairs", title = "Locate Me",
+      onClick = JS("function(btn, map){ map.locate({setView: true}); }"))) %>%
+    htmlwidgets::onRender(paste0("
+      function(el, x) {
+      $('head').append(",responsiveness,");
+      }")
+    ) %>%
+    # admin boundaries
+    # predictions
+    leaflet::addPolygons(
+      group = "response",
+      color = "#444444", stroke = FALSE, weight = 1, smoothFactor = 0.8,
+      opacity = 1.0, fillOpacity = 0.6,
+      fillColor = ~tractionPal(response),
+      label = ~ paste(
+        "prediction:", format(round(spatialized.KR.sf$response, 2), nsmall = 2)),
+      # popup = ~as.character(response),
+      highlightOptions = highlightOptions(color = "white", weight = 2,
+        bringToFront = TRUE)
+    ) %>%
+    #legend
+    leaflet::addLegend(
+      position = "bottomright", pal = tractionPal, values = ~response,
+      title = "traction",
+      group = "response",
+      opacity = 1
+    )
+
+
+```
+
+Normalization
+
+```{r reading-data-raw}
+dataset = read.csv(file = "./raw-data/tracteur.csv", header = TRUE,sep = ";" )
+shapefile = sf::st_read(dsn = "./raw-data/shapefile/reves_WGS84.shp")
+
+# transforming to spatial sf object
+dataset.sf = sf::st_as_sf(dataset, coords = c("long_deg", "lat_deg"))
+# transforming to spatial sf object
+dataset.sf = sf::st_as_sf(dataset, coords = c("long_deg", "lat_deg"))
+# setting the CRS (coordinate reference system)
+dataset.sf = sf::st_set_crs(dataset.sf, 4326)
+# instersecting
+dataset.sf = sf::st_intersection(dataset.sf, shapefile)
+
+# solution to remove duplicate locations
+dataset.sp = as(dataset.sf, "Spatial")[-sp::zerodist(as(dataset.sf, "Spatial"))[,1],] 
+dataset.sf = sf::st_as_sf(dataset.sp)
+
+# making it projected instead of coordinates (for interpolation) and tranforming to dataframe
+dataset = sf::st_transform(dataset.sf, 3812)
+coordinates = data.frame(sf::st_coordinates(dataset))
+sf::st_geometry(dataset) = NULL
+
+# putting coordinates in the dataframe
+dataset = dataset %>%
+  dplyr::bind_cols(coordinates)
+
+# renaming X and Y to x and y for gstat learner to work
+dataset = dataset %>%
+  dplyr::rename(x = X) %>%
+  dplyr::rename(y = Y)
+
+# plotting the map
+plot(sf::st_as_sf(dataset, coords = c("y","x"))["traction"])
+```
+
+
+```{r histogram}
+# traction.d = density(dataset$traction)
+# plot(traction.d)
+# traction.n = scale(dataset$traction)
+# traction.n.d = density(traction.n)
+# plot(traction.n.d)
+
+# normalization with boxcox
+# https://github.com/petersonR/bestNormalize
+dataset = dataset %>%
+  dplyr::mutate(traction_m = traction + abs(min(traction)) + 1)
+
+traction.bcn = bestNormalize::boxcox(dataset$traction_m)
+
+traction.bcn.d = density(traction.bcn$x.t)
+plot(traction.bcn.d)
+
+dataset = dataset %>%
+  dplyr::bind_cols(traction.bcn = data.frame(traction.bcn$x.t)) %>%
+  dplyr::rename(traction.norm = traction.bcn.x.t)
+
+# plot the map
+plot(sf::st_as_sf(dataset, coords = c("y","x"))["traction.norm"])
+```
+
+```{r kriging after normalization and residuals}
+# defining the poly2 plan model
+traction.poly2 = spatial::surf.ls(np = 2, x = dataset$x, y = dataset$y, z = dataset$traction.norm)
+
+# poly2 predictions at observations
+traction.poly2.preds = predict(object = traction.poly2, x = dataset$x, y = dataset$y)
+
+# data - trend for residuals
+traction.poly2.res = dataset$traction.norm - traction.poly2.preds
+
+# adding to dataset
+dataset = dataset %>%
+  dplyr::bind_cols(traction.norm.res = traction.poly2.res )
+
+# plot the map
+plot(sf::st_as_sf(dataset, coords = c("y","x"))["traction.norm.res"])
+
+# dataset as spatial object class sp
+dataset.sf = dataset
+dataset.sf = sf::st_as_sf(dataset.sf, coords = c("y", "x"))
+dataset.sf = sf::st_set_crs(dataset.sf, 3812)
+coordinates = data.frame(sf::st_coordinates(dataset.sf))
+
+# putting coordinates in the dataframe ::FIXEME:: maybe useless
+dataset.sf = dataset.sf %>%
+  dplyr::bind_cols(coordinates)
+
+# renaming X and Y to x and y for gstat learner to work
+dataset.sf = dataset.sf %>%
+  dplyr::rename(x = X) %>%
+  dplyr::rename(y = Y)
+
+plot(dataset.sf["traction.norm.res"] )
+dataset.sp = as(dataset.sf, "Spatial")
+sp::spplot(dataset.sp["traction.norm.res"])
+
+#::ALLGOOD::#
+
+# making and plotting the variogram
+traction.norm.res.vgm = gstat::variogram(traction.norm.res~1, dataset.sp)
+plot(traction.norm.res.vgm)
+
+# manually fitting a model to the vgm with constant mean
+# https://gisgeography.com/semi-variogram-nugget-range-sill/
+traction.norm.res.fit = gstat::fit.variogram(
+  object = traction.norm.res.vgm,
+  model = gstat::vgm(
+    psill = 0.9, model = "Sph", range =  150, nugget = 0.7))
+plot(traction.norm.res.vgm, traction.norm.res.fit)
+
+# remaking the grid from scratch
+interpolation.grid.sf = sf::st_make_grid(x = sf::st_transform(shapefile, crs = 3812),  cellsize = 10, what = "centers")
+
+# converting the interpolation grid to normal dataframe
+interpolation.grid = interpolation.grid.sf
+# making it projected instead of coordinates
+interpolation.grid = sf::st_transform(interpolation.grid, 3812)
+coordinates = data.frame(sf::st_coordinates(interpolation.grid))
+
+# putting coordinates in the dataframe
+interpolation.grid = coordinates
+
+# renaming X and Y to x and y for gstat learner to work
+interpolation.grid  = interpolation.grid  %>%
+  dplyr::rename(x = X) %>%
+  dplyr::rename(y = Y) %>%
+  dplyr::bind_cols(coordinates)
+
+interpolation.grid.sf = sf::st_as_sf(interpolation.grid, coords = c("Y", "X"))
+interpolation.grid.sf = sf::st_set_crs(interpolation.grid.sf, 3812)
+
+interpolation.grid.sp = as(interpolation.grid.sf, "Spatial")
+sp::gridded(interpolation.grid.sp) = TRUE
+
+
+# interpolating the residuals
+# to solve the memory error  => https://github.com/edzer/gstat/issues/6
+# https://gis.stackexchange.com/questions/245295/error-in-kriging-function
+traction.norm.res.kr = gstat::krige(
+  traction.norm.res~1,
+  dataset.sp,
+  interpolation.grid.sp,
+  model = traction.norm.res.fit,
+  maxdist = 30)
+
+traction.norm.res.kr.sf = sf::st_as_sf(traction.norm.res.kr)
+
+# plotting the interpolation of the residuals
+traction.norm.res.kr.plot = sp::spplot(traction.norm.res.kr["var1.pred"], do.log = F, colorkey = TRUE)
+traction.norm.res.kr.plot
+
+# poly2 predictions at prediction grid points locations
+traction.poly2.grid.preds = predict(
+  object = traction.poly2,
+  x = data.frame(interpolation.grid.sp)$x,
+  y = data.frame(interpolation.grid.sp)$y)
+
+# Addition of prediction of kriging of residuals and polynomial2 trend predictions at grid points locations
+traction.norm.kr = data.frame(traction.norm.res.kr["var1.pred"]) + traction.poly2.grid.preds
+
+# denormalizing the data by performing reverse transformation
+traction.kr =  predict(traction.bcn, newdata = traction.norm.kr$var1.pred, inverse = TRUE)
+traction.kr = data.frame(traction.kr = traction.kr)
+
+# to get back to the original data
+traction.kr = traction.kr %>%
+    dplyr::mutate(traction.kr = traction.kr - (abs(min(dataset$traction))) - 1)
+
+# joining to the spatial object
+spatialized.kr = interpolation.grid %>%
+  dplyr::bind_cols(traction.kr)
+
+spatialized.kr.sf = sf::st_as_sf(spatialized.kr, coords = c("Y", "X"))
+
+plot(spatialized.kr.sf["traction.kr"])
+
+spatialized.kr.sf = sf::st_set_crs(spatialized.kr.sf, 3812)
+spatialized.kr.sf = sf::st_transform(spatialized.kr.sf, 4326)
+
+# Building a grid of pixels of 10 m² that spatially matches our grid of centers. To do so, we must work with projected data (to define the cellsize)
+interpolation.grid.pixels.sf = sf::st_sf(sf::st_make_grid(x = sf::st_transform(shapefile, crs = 3812),  cellsize = 10, what = "polygons"))
+
+# adding the predictions to the grid squares object
+spatialized.kr.sf = interpolation.grid.pixels.sf %>%
+        dplyr::bind_cols(spatialized.kr.sf)
+
+# transforming to 4326
+spatialized.kr.sf = sf::st_transform(spatialized.kr.sf, 4326)
+
+# intersecting with shapefile
+spatialized.kr.sf =  sf::st_intersection(spatialized.kr.sf, shapefile)
+
+# mapping 
+mapview::mapview(spatialized.kr.sf["traction.kr"])
+
+# to make the map responsive
+responsiveness = "\'<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\'"
+  
+# defining the color palette for traction
+tractionPal = leaflet::colorNumeric(
+  palette = "RdYlBu", #"RdBl",
+  reverse = TRUE,
+  domain = spatialized.kr.sf$traction.kr, #spatialized$response,
+  na.color = "black"
+)
+
+traction.map = leaflet::leaflet(spatialized.kr.sf) %>%
+    # basemaps
+    leaflet::addProviderTiles(group = "Satellite",
+      providers$Esri.WorldImagery,
+      options = providerTileOptions(opacity = 1)
+    ) %>%
+    leaflet::addProviderTiles(group = "Stamen",
+      providers$Stamen.Toner,
+      options = providerTileOptions(opacity = 0.25)
+    ) %>%
+    # centering the map
+    leaflet::fitBounds(sf::st_bbox(spatialized.kr.sf)[[1]],
+      sf::st_bbox(spatialized.kr.sf)[[2]],
+      sf::st_bbox(spatialized.kr.sf)[[3]],
+      sf::st_bbox(spatialized.kr.sf)[[4]]
+    ) %>%
+    # adding layer control button
+    leaflet::addLayersControl(
+      baseGroups = c("Satellite","Stamen"),
+     # overlayGroups = c("prediction"),
+      overlayGroups = c("response"),
+        options = layersControlOptions(collapsed = TRUE)
+      ) %>%
+    # fullscreen button
+    leaflet.extras::addFullscreenControl() %>%
+    # location button
+    leaflet::addEasyButton(easyButton(
+      icon = "fa-crosshairs", title = "Locate Me",
+      onClick = JS("function(btn, map){ map.locate({setView: true}); }"))) %>%
+    htmlwidgets::onRender(paste0("
+      function(el, x) {
+      $('head').append(",responsiveness,");
+      }")
+    ) %>%
+    # admin boundaries
+    # predictions
+    leaflet::addPolygons(
+      group = "response",
+      color = "#444444", stroke = FALSE, weight = 1, smoothFactor = 0.8,
+      opacity = 1.0, fillOpacity = 0.6,
+      fillColor = ~tractionPal(traction.kr),
+      label = ~ paste(
+        "prediction:", format(round(spatialized.kr.sf$traction.kr, 2), nsmall = 2)),
+      # popup = ~as.character(traction.kr),
+      highlightOptions = highlightOptions(color = "white", weight = 2,
+        bringToFront = TRUE)
+    ) %>%
+    #legend
+    leaflet::addLegend(
+      position = "bottomright", pal = tractionPal, values = ~traction.kr,
+      title = "traction",
+      group = "response",
+      opacity = 1
+    )
+
+
+```
+
+
